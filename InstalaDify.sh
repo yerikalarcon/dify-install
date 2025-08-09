@@ -2,10 +2,16 @@
 set -euo pipefail
 
 # =========================
-# Instalador Dify (Self-host)
+# Instalador Dify (Self-host) para Ubuntu 24.x
 # Modo: Nginx del sistema + Docker Compose
 # Uso:  ./InstalaDify.sh dify.urmah.ai
-# Requisitos: docker, docker compose, git, nginx y certificados wildcard ya instalados.
+# Requisitos previos:
+#   - Nginx instalado y corriendo (config por defecto de Ubuntu)
+#   - Docker y Docker Compose instalados
+#   - Este script y los certificados (fullchain.pem, privkey.pem) están en la MISMA carpeta
+# Notas de seguridad:
+#   - Los .pem se COPIAN a /etc/ssl/certificados/<dominio>/ con permisos 644/600 y root:root
+#   - Postgres persistente en /opt/dify/<dominio>/data/postgres
 # =========================
 
 # --------- Helpers ---------
@@ -24,10 +30,18 @@ if [ $# -lt 1 ]; then
 fi
 
 DOMAIN="$1"
+
+# Directorio donde se ejecuta el script (donde están los .pem)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_FULLCHAIN="${SCRIPT_DIR}/fullchain.pem"
+SRC_PRIVKEY="${SCRIPT_DIR}/privkey.pem"
+
+# Destino estándar para Nginx
+CERT_DST_DIR="/etc/ssl/certificados/${DOMAIN}"
+DST_FULLCHAIN="${CERT_DST_DIR}/fullchain.pem"
+DST_PRIVKEY="${CERT_DST_DIR}/privkey.pem"
+
 INSTALL_DIR="/opt/dify/${DOMAIN}"
-CERT_DIR="/etc/ssl/certificados/${DOMAIN}"
-FULLCHAIN="${CERT_DIR}/fullchain.pem"
-PRIVKEY="${CERT_DIR}/privkey.pem"
 
 # --------- Requisitos mínimos ---------
 need_cmd git
@@ -45,20 +59,35 @@ else
   exit 1
 fi
 
-# --------- Validaciones previas ---------
-if [ ! -f "${FULLCHAIN}" ] || [ ! -f "${PRIVKEY}" ]; then
-  red "[ERROR] No se encontraron certificados en:"
-  red "  ${FULLCHAIN}"
-  red "  ${PRIVKEY}"
-  red "Asegúrate de colocarlos ahí antes de continuar."
-  exit 1
-fi
-
-# Verifica que Nginx cargue confs de sites-available/sites-enabled (Ubuntu por defecto)
+# Verifica estructura Nginx estilo Ubuntu
 if [ ! -d /etc/nginx/sites-available ] || [ ! -d /etc/nginx/sites-enabled ]; then
   red "[ERROR] Esta instalación espera Nginx estilo Ubuntu (sites-available/sites-enabled)."
   exit 1
 fi
+
+# --------- Validación de certificados en el mismo folder del script ---------
+if [ ! -f "${SRC_FULLCHAIN}" ] || [ ! -f "${SRC_PRIVKEY}" ]; then
+  red "[ERROR] No se encontraron certificados Junto al script:"
+  red "  ${SRC_FULLCHAIN}"
+  red "  ${SRC_PRIVKEY}"
+  exit 1
+fi
+
+# --------- Instalar certificados en ruta estándar y asegurar permisos ---------
+yellow "🔐 Instalando certificados en ${CERT_DST_DIR} ..."
+sudo mkdir -p "${CERT_DST_DIR}"
+# Copia con permisos temporales; luego ajustamos ownership/permissions
+sudo cp -f "${SRC_FULLCHAIN}" "${DST_FULLCHAIN}"
+sudo cp -f "${SRC_PRIVKEY}"  "${DST_PRIVKEY}"
+
+# Propiedad root:root y permisos seguros
+sudo chown root:root "${DST_FULLCHAIN}" "${DST_PRIVKEY}"
+sudo chmod 644 "${DST_FULLCHAIN}"
+sudo chmod 600 "${DST_PRIVKEY}"
+
+green "✅ Certificados instalados:"
+echo "  ${DST_FULLCHAIN} (644, root:root)"
+echo "  ${DST_PRIVKEY} (600, root:root)"
 
 # --------- Preparación de estructura ---------
 sudo mkdir -p "${INSTALL_DIR}"
@@ -67,7 +96,7 @@ cd "${INSTALL_DIR}"
 
 green "📁 Carpeta de instalación: ${INSTALL_DIR}"
 
-# --------- Clonar Dify (solo docker compose base) ---------
+# --------- Clonar/actualizar Dify ---------
 if [ ! -d "${INSTALL_DIR}/dify" ]; then
   green "📥 Clonando Dify..."
   git clone --depth=1 https://github.com/langgenius/dify.git dify
@@ -76,18 +105,16 @@ else
   (cd dify && git pull --ff-only)
 fi
 
-# Copiamos el compose base del repo oficial a esta instancia
+# Copiar compose base oficial
 cp -f "dify/docker/docker-compose.yaml" "${INSTALL_DIR}/docker-compose.yaml"
 
 # --------- .env de esta instancia ---------
-# Usamos el .env.example del repo como base si existe; si no, creamos uno mínimo.
 if [ -f "dify/docker/.env.example" ]; then
   cp -f "dify/docker/.env.example" "${INSTALL_DIR}/.env"
 else
   touch "${INSTALL_DIR}/.env"
 fi
 
-# Función para upsert de variables en .env
 upsert_env() {
   local key="$1"; shift
   local val="$1"; shift
@@ -189,8 +216,8 @@ server {
     listen [::]:443 ssl http2;
     server_name ${DOMAIN};
 
-    ssl_certificate     ${FULLCHAIN};
-    ssl_certificate_key ${PRIVKEY};
+    ssl_certificate     ${DST_FULLCHAIN};
+    ssl_certificate_key ${DST_PRIVKEY};
     ssl_session_timeout 1d;
     ssl_session_cache shared:MozSSL:10m;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -235,7 +262,7 @@ server {
 }
 NGINX
 
-green "📝 Escribiendo vhost Nginx: ${NGINX_CONF}"
+echo "📝 Escribiendo vhost Nginx: ${NGINX_CONF}"
 sudo mv "${TMP_CONF}" "${NGINX_CONF}"
 sudo ln -sf "${NGINX_CONF}" "/etc/nginx/sites-enabled/${DOMAIN}.conf"
 
@@ -248,7 +275,6 @@ green "✅ Nginx OK"
 yellow "🐳 Iniciando Dify (puede tardar la primera vez, imágenes grandes)..."
 cd "${INSTALL_DIR}"
 
-# Arrancamos solo los servicios que necesitamos (sin nginx de Docker)
 ${COMPOSE_CMD} -f docker-compose.yaml -f docker-compose.override.yaml up -d postgres redis
 sleep 3
 ${COMPOSE_CMD} -f docker-compose.yaml -f docker-compose.override.yaml up -d web api worker plugin_daemon
@@ -265,7 +291,6 @@ curl -fsSI "http://127.0.0.1:5002" >/dev/null && green "  Plugin (127.0.0.1:5002
 
 green "🧪 Verificando por HTTPS..."
 curl -fsSI "https://${DOMAIN}/" >/dev/null && green "  https://${DOMAIN}/ OK" || { red "  HTTPS raíz no responde"; exit 1; }
-# Prueba CORS observando que responda algo (no validamos header aquí porque depende del endpoint)
 curl -fsSI -H "Origin: https://${DOMAIN}" "https://${DOMAIN}/api" >/dev/null || yellow "  /api puede dar 404 (normal), pero host responde."
 
 green "🎉 Instalación completada."
