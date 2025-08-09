@@ -67,7 +67,7 @@ fi
 
 # --------- Validación de certificados en el mismo folder del script ---------
 if [ ! -f "${SRC_FULLCHAIN}" ] || [ ! -f "${SRC_PRIVKEY}" ]; then
-  red "[ERROR] No se encontraron certificados Junto al script:"
+  red "[ERROR] No se encontraron certificados junto al script:"
   red "  ${SRC_FULLCHAIN}"
   red "  ${SRC_PRIVKEY}"
   exit 1
@@ -76,15 +76,11 @@ fi
 # --------- Instalar certificados en ruta estándar y asegurar permisos ---------
 yellow "🔐 Instalando certificados en ${CERT_DST_DIR} ..."
 sudo mkdir -p "${CERT_DST_DIR}"
-# Copia con permisos temporales; luego ajustamos ownership/permissions
 sudo cp -f "${SRC_FULLCHAIN}" "${DST_FULLCHAIN}"
 sudo cp -f "${SRC_PRIVKEY}"  "${DST_PRIVKEY}"
-
-# Propiedad root:root y permisos seguros
 sudo chown root:root "${DST_FULLCHAIN}" "${DST_PRIVKEY}"
 sudo chmod 644 "${DST_FULLCHAIN}"
 sudo chmod 600 "${DST_PRIVKEY}"
-
 green "✅ Certificados instalados:"
 echo "  ${DST_FULLCHAIN} (644, root:root)"
 echo "  ${DST_PRIVKEY} (600, root:root)"
@@ -93,7 +89,6 @@ echo "  ${DST_PRIVKEY} (600, root:root)"
 sudo mkdir -p "${INSTALL_DIR}"
 sudo chown -R "${USER}:${USER}" "${INSTALL_DIR}"
 cd "${INSTALL_DIR}"
-
 green "📁 Carpeta de instalación: ${INSTALL_DIR}"
 
 # --------- Clonar/actualizar Dify ---------
@@ -155,17 +150,16 @@ cat > "${INSTALL_DIR}/initdb/01-pgvector.sql" <<'SQL'
 CREATE EXTENSION IF NOT EXISTS vector;
 SQL
 
-# Override mínimo: publicar puertos a localhost, persistencias y vars críticas.
+# Override reforzado: publica puertos a localhost, fija imágenes de postgres/redis y persistencias
 cat > "${INSTALL_DIR}/docker-compose.override.yaml" <<'YAML'
-version: '3.8'
 services:
   web:
-    # Dify web UI
+    restart: unless-stopped
     ports:
       - "127.0.0.1:3000:3000"
 
   api:
-    # API pública detrás de Nginx del sistema
+    restart: unless-stopped
     ports:
       - "127.0.0.1:5001:5001"
     environment:
@@ -176,24 +170,33 @@ services:
       SECRET_KEY: ${SECRET_KEY}
 
   worker:
+    restart: unless-stopped
     environment:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
       SECRET_KEY: ${SECRET_KEY}
 
   plugin_daemon:
-    # Endpoints de extensiones
+    restart: unless-stopped
     ports:
       - "127.0.0.1:5002:5002"
     environment:
       REDIS_URL: ${REDIS_URL}
 
   postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
       - ./initdb:/docker-entrypoint-initdb.d
 
   redis:
+    image: redis:7
+    restart: unless-stopped
     volumes:
       - ./data/redis:/data
 YAML
@@ -222,43 +225,24 @@ server {
     ssl_session_cache shared:MozSSL:10m;
     ssl_protocols TLSv1.2 TLSv1.3;
 
-    # Tamaños y cabeceras comunes
     client_max_body_size 50m;
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
 
-    # WebSocket
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
 
-    # Frontend (web)
-    location = / {
-        proxy_pass http://127.0.0.1:3000;
-    }
-    location /explore {
-        proxy_pass http://127.0.0.1:3000;
-    }
+    location = / { proxy_pass http://127.0.0.1:3000; }
+    location /explore { proxy_pass http://127.0.0.1:3000; }
 
-    # API
-    location /api {
-        proxy_pass http://127.0.0.1:5001;
-    }
-    location /v1 {
-        proxy_pass http://127.0.0.1:5001;
-    }
-    location /files {
-        proxy_pass http://127.0.0.1:5001;
-    }
-    location /console/api {
-        proxy_pass http://127.0.0.1:5001;
-    }
+    location /api { proxy_pass http://127.0.0.1:5001; }
+    location /v1 { proxy_pass http://127.0.0.1:5001; }
+    location /files { proxy_pass http://127.0.0.1:5001; }
+    location /console/api { proxy_pass http://127.0.0.1:5001; }
 
-    # Plugin daemon
-    location /e/ {
-        proxy_pass http://127.0.0.1:5002;
-    }
+    location /e/ { proxy_pass http://127.0.0.1:5002; }
 }
 NGINX
 
@@ -276,7 +260,7 @@ yellow "🐳 Iniciando Dify (puede tardar la primera vez, imágenes grandes)..."
 cd "${INSTALL_DIR}"
 
 ${COMPOSE_CMD} -f docker-compose.yaml -f docker-compose.override.yaml up -d postgres redis
-sleep 3
+sleep 4
 ${COMPOSE_CMD} -f docker-compose.yaml -f docker-compose.override.yaml up -d web api worker plugin_daemon
 
 # --------- Recargar Nginx ---------
