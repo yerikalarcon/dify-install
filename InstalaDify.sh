@@ -1,336 +1,233 @@
+cat > ~/dify_oneclick.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# InstalaDify.sh — Instalación completa y robusta de Dify
-# Ubuntu 24.x • Nginx del sistema • Docker + Compose
-# Uso:  ./InstalaDify.sh <dominio>   (ej. ./InstalaDify.sh dify.urmah.ai)
-# Requisitos: Ejecutar como usuario normal con sudo habilitado.
-# Certificados: este script DEBE vivir junto a fullchain.pem y privkey.pem.
-# ============================================================
+# ---------- Config mínima ----------
+DOMAIN="${1:-}"
+COMPOSE_DIR="/opt/dify/dify.urmah.ai"
+DB_USER="dify"
+DB_PASS="555b9fc5be6492eec1f79e0049ad711c"
+DB_NAME="dify"
+API_PORT="5001"
+WEB_PORT="3000"
+PLUGIN_PORT="5002"
+
+if [[ -z "$DOMAIN" ]]; then
+  echo "Uso: $0 <dominio>   Ej: $0 dify.urmah.ai" >&2
+  exit 1
+fi
 
 # ---------- Helpers ----------
-_red()   { echo -e "\033[31m$*\033[0m"; }
-_green() { echo -e "\033[32m$*\033[0m"; }
-_yellow(){ echo -e "\033[33m$*\033[0m"; }
+log(){ echo -e "[$(date +'%H:%M:%S')] $*"; }
 
-_need_cmd() { command -v "$1" >/dev/null 2>&1 || return 1; }
-
-_asroot() {
-  # Ejecuta un comando con sudo solo si no eres root
-  if [ "$(id -u)" -eq 0 ]; then bash -c "$*"; else sudo bash -c "$*"; fi
-}
-
-_die() { _red "[ERROR] $*"; exit 1; }
-
-# ---------- Parámetros ----------
-if [ $# -lt 1 ]; then
-  _die "Uso: $0 <dominio>   (ej: $0 dify.urmah.ai)"
-fi
-DOMAIN="$1"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC_FULLCHAIN="${SCRIPT_DIR}/fullchain.pem"
-SRC_PRIVKEY="${SCRIPT_DIR}/privkey.pem"
-
-[ -f "$SRC_FULLCHAIN" ] || _die "No se encontró ${SRC_FULLCHAIN}"
-[ -f "$SRC_PRIVKEY"  ] || _die "No se encontró ${SRC_PRIVKEY}"
-
-INSTALL_DIR="/opt/dify/${DOMAIN}"
-CERT_DST_DIR="/etc/ssl/certificados/${DOMAIN}"
-DST_FULLCHAIN="${CERT_DST_DIR}/fullchain.pem"
-DST_PRIVKEY="${CERT_DST_DIR}/privkey.pem"
-
-# ---------- Preinstalación: paquetes base ----------
-_green "🔧 Preparando sistema..."
-_asroot "apt-get update -y"
-# Nginx, ca-certs, curl, gnupg, git, openssl, jq para checks, ufw (si usas firewall)
-_asroot "apt-get install -y nginx ca-certificates curl gnupg git openssl jq"
-
-# ---------- Docker & Compose ----------
-if ! _need_cmd docker; then
-  _yellow "🐳 Instalando Docker Engine + Compose..."
-  _asroot "install -m 0755 -d /etc/apt/keyrings"
-  _asroot "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg"
-  _asroot "chmod a+r /etc/apt/keyrings/docker.gpg"
-  _asroot "sh -c 'echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \$(. /etc/os-release && echo \$VERSION_CODENAME) stable\" > /etc/apt/sources.list.d/docker.list'"
-  _asroot "apt-get update -y"
-  _asroot "apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
-  _asroot "systemctl enable --now docker"
-fi
-
-# Asegurar que el usuario actual puede usar Docker (si no, usamos sudo docker)
-DOCKER="docker"
-if ! docker ps >/dev/null 2>&1; then
-  _yellow "🔐 Añadiendo usuario '$(whoami)' al grupo docker..."
-  _asroot "usermod -aG docker $(whoami) || true"
-  # No podemos reabrir sesión aquí; como fallback usaremos sudo docker en esta corrida
+# Detectar docker (con sudo si hace falta)
+if docker info >/dev/null 2>&1; then
+  DOCKER="docker"
+elif sudo -n docker info >/dev/null 2>&1; then
   DOCKER="sudo docker"
-fi
-
-# Determinar Compose
-if $DOCKER compose version >/dev/null 2>&1; then
-  COMPOSE_CMD="$DOCKER compose"
-elif _need_cmd docker-compose; then
-  COMPOSE_CMD="$DOCKER-compose"
 else
-  _die "No se encontró docker compose ni docker-compose tras la instalación."
-fi
-
-# ---------- Nginx base ----------
-_green "🕸️ Verificando Nginx..."
-[ -d /etc/nginx/sites-available ] && [ -d /etc/nginx/sites-enabled ] || _die "Nginx no es la variante de Ubuntu (faltan sites-available/sites-enabled)."
-_asroot "systemctl enable --now nginx"
-
-# UFW (opcional): si está activo, permitir Nginx
-if _need_cmd ufw && _asroot "ufw status | grep -q active"; then
-  _yellow "🔓 UFW activo; abriendo Nginx Full..."
-  _asroot "ufw allow 'Nginx Full' || true"
-fi
-
-# ---------- Instalar certificados ----------
-_yellow "🔐 Instalando certificados en ${CERT_DST_DIR}..."
-_asroot "mkdir -p '${CERT_DST_DIR}'"
-_asroot "cp -f '${SRC_FULLCHAIN}' '${DST_FULLCHAIN}'"
-_asroot "cp -f '${SRC_PRIVKEY}'  '${DST_PRIVKEY}'"
-_asroot "chown root:root '${DST_FULLCHAIN}' '${DST_PRIVKEY}'"
-_asroot "chmod 644 '${DST_FULLCHAIN}'"
-_asroot "chmod 600 '${DST_PRIVKEY}'"
-_green "✅ Certificados listos"
-
-# ---------- Estructura de instalación ----------
-_asroot "mkdir -p '${INSTALL_DIR}'"
-_asroot "chown -R $(whoami):$(whoami) '${INSTALL_DIR}'"
-cd "${INSTALL_DIR}"
-
-# ---------- Clonar/actualizar Dify ----------
-if [ ! -d "${INSTALL_DIR}/dify" ]; then
-  _green "📥 Clonando Dify..."
-  git clone --depth=1 https://github.com/langgenius/dify.git dify
-else
-  _green "🔄 Actualizando Dify..."
-  (cd dify && git pull --ff-only)
-fi
-
-# Copiar compose base
-cp -f "dify/docker/docker-compose.yaml" "${INSTALL_DIR}/docker-compose.yaml"
-
-# ---------- .env ----------
-if [ -f "dify/docker/.env.example" ]; then
-  cp -f "dify/docker/.env.example" "${INSTALL_DIR}/.env"
-else
-  : > "${INSTALL_DIR}/.env"
-fi
-
-_upsert_env() {
-  local k="$1" v="$2"
-  if grep -qE "^${k}=" .env; then
-    sed -i "s|^${k}=.*|${k}=${v}|" .env
+  # Último intento: si docker requiere sudo, pedimos sudo una vez
+  if sudo docker info >/dev/null 2>&1; then
+    DOCKER="sudo docker"
   else
-    echo "${k}=${v}" >> .env
+    echo "No puedo usar Docker. Asegúrate de tener Docker instalado y permisos (o sudo)." >&2
+    exit 1
   fi
-}
+fi
 
-POSTGRES_DB="dify"
-POSTGRES_USER="dify"
-POSTGRES_PASSWORD="$(openssl rand -hex 16)"
-SECRET_KEY="$(openssl rand -hex 32)"
-SESSION_SECRET="$(openssl rand -hex 32)"
-DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}"
-REDIS_URL="redis://redis:6379/0"
+DC="$DOCKER compose -f $COMPOSE_DIR/docker-compose.yaml -f $COMPOSE_DIR/docker-compose.override.yaml"
 
-_upsert_env WEB_API_CORS_ALLOW_ORIGINS "https://${DOMAIN}"
-_upsert_env CONSOLE_CORS_ALLOW_ORIGINS  "https://${DOMAIN}"
-_upsert_env POSTGRES_DB     "${POSTGRES_DB}"
-_upsert_env POSTGRES_USER   "${POSTGRES_USER}"
-_upsert_env POSTGRES_PASSWORD "${POSTGRES_PASSWORD}"
-_upsert_env DATABASE_URL    "${DATABASE_URL}"
-_upsert_env REDIS_URL       "${REDIS_URL}"
-_upsert_env SECRET_KEY      "${SECRET_KEY}"
-_upsert_env SESSION_SECRET  "${SESSION_SECRET}"
-
-# ---------- Persistencia e initdb ----------
-mkdir -p "${INSTALL_DIR}/data/postgres" "${INSTALL_DIR}/data/redis" "${INSTALL_DIR}/initdb"
-
-# Habilitar pgvector y crear DB del plugin de forma idempotente al primer init
-cat > "${INSTALL_DIR}/initdb/01-pgvector.sql" <<'SQL'
-CREATE EXTENSION IF NOT EXISTS vector;
-SQL
-
-cat > "${INSTALL_DIR}/initdb/02-create-plugin-db.sh" <<'BASH'
-#!/usr/bin/env bash
-set -e
-# Este script se ejecuta SOLO en el primer init del cluster.
-psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres <<'SQL'
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_database WHERE datname = 'dify_plugin') THEN
-    PERFORM dblink_connect('dbname=' || current_database());
-    EXECUTE 'CREATE DATABASE dify_plugin OWNER ' || current_user;
-  END IF;
-END
-$$;
-SQL
-BASH
-chmod +x "${INSTALL_DIR}/initdb/02-create-plugin-db.sh"
-
-# ---------- Override reforzado ----------
-cat > "${INSTALL_DIR}/docker-compose.override.yaml" <<'YAML'
+# ---------- Crear override de DB para todos los servicios relevantes ----------
+log "Escribiendo override de DB…"
+mkdir -p "$COMPOSE_DIR"
+cat > "$COMPOSE_DIR/docker-compose.dbfix.yaml" <<YAML
 services:
-  web:
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:3000:3000"
-
   api:
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:5001:5001"
     environment:
-      WEB_API_CORS_ALLOW_ORIGINS: ${WEB_API_CORS_ALLOW_ORIGINS}
-      CONSOLE_CORS_ALLOW_ORIGINS: ${CONSOLE_CORS_ALLOW_ORIGINS}
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      SECRET_KEY: ${SECRET_KEY}
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USERNAME: ${DB_USER}
+      DB_PASSWORD: ${DB_PASS}
+      DB_DATABASE: ${DB_NAME}
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
 
   worker:
-    restart: unless-stopped
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      SECRET_KEY: ${SECRET_KEY}
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USERNAME: ${DB_USER}
+      DB_PASSWORD: ${DB_PASS}
+      DB_DATABASE: ${DB_NAME}
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
+
+  worker_beat:
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USERNAME: ${DB_USER}
+      DB_PASSWORD: ${DB_PASS}
+      DB_DATABASE: ${DB_NAME}
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
 
   plugin_daemon:
-    restart: unless-stopped
-    depends_on:
-      - redis
-      - db
-    ports:
-      - "127.0.0.1:5002:5002"
     environment:
-      REDIS_URL: ${REDIS_URL}
-      # Forzar credenciales a Postgres para el plugin
-      PGHOST: db
-      PGUSER: ${POSTGRES_USER}
-      PGPASSWORD: ${POSTGRES_PASSWORD}
-      PGDATABASE: dify_plugin
-
-  # Base de datos y Redis con imágenes explícitas y persistencia
-  db:
-    image: postgres:15
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data
-      - ./initdb:/docker-entrypoint-initdb.d
-
-  redis:
-    image: redis:7
-    restart: unless-stopped
-    volumes:
-      - ./data/redis:/data
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USERNAME: ${DB_USER}
+      DB_PASSWORD: ${DB_PASS}
+      DB_DATABASE: dify_plugin
 YAML
 
-# ---------- Nginx vhost ----------
-NGINX_CONF="/etc/nginx/sites-available/${DOMAIN}.conf"
-TMP_CONF="$(mktemp)"
-cat > "${TMP_CONF}" <<NGINX
-# Dify - ${DOMAIN}
+DC_ALL="$DC -f $COMPOSE_DIR/docker-compose.dbfix.yaml"
+
+# ---------- Subir DB y Redis primero ----------
+log "Levantando DB y Redis…"
+$DC up -d db redis
+sleep 2
+
+# Esperar a que Postgres esté listo (con usuario dify)
+log "Esperando a Postgres (db=${DB_NAME}, user=${DB_USER})…"
+for i in {1..60}; do
+  if $DC exec -T db pg_isready -h db -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1; then
+    log "Postgres listo."
+    break
+  fi
+  sleep 1
+  [[ $i -eq 60 ]] && { echo "Postgres no estuvo listo a tiempo." >&2; exit 1; }
+done
+
+# ---------- Subir API/Worker/Web/Plugin ----------
+log "Levantando api, worker, web, plugin_daemon…"
+$DC_ALL up -d api worker web plugin_daemon
+sleep 3
+
+# ---------- Parche de Nginx vhost ----------
+log "Parcheando vhost Nginx para ${DOMAIN}…"
+VHOST="/etc/nginx/sites-available/${DOMAIN}.conf"
+BACKUP="${VHOST}.bak.$(date +%Y%m%d_%H%M%S)"
+if [[ -f "$VHOST" ]]; then sudo cp -a "$VHOST" "$BACKUP"; fi
+
+sudo tee "$VHOST" >/dev/null <<NGINX
 server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
     return 301 https://\$host\$request_uri;
 }
-
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name ${DOMAIN};
 
-    ssl_certificate     ${DST_FULLCHAIN};
-    ssl_certificate_key ${DST_PRIVKEY};
-    ssl_session_timeout 1d;
-    ssl_session_cache shared:MozSSL:10m;
-    ssl_protocols TLSv1.2 TLSv1.3;
+    # Certs (ajusta si usas otra ruta)
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
 
-    client_max_body_size 50m;
+    # Básicos
+    client_max_body_size 100M;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
 
+    # Cabeceras proxy comunes
+    set \$upstream_http_x_forwarded_proto https;
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header X-Forwarded-Proto https;
 
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection "upgrade";
+    # Web (Next.js)
+    location / {
+        proxy_pass http://127.0.0.1:${WEB_PORT};
+    }
+    location /apps {
+        proxy_pass http://127.0.0.1:${WEB_PORT};
+    }
 
-    location = / { proxy_pass http://127.0.0.1:3000; }
-    location /explore { proxy_pass http://127.0.0.1:3000; }
+    # API (console y pública)
+    location /console/api/ {
+        proxy_pass http://127.0.0.1:${API_PORT}/console/api/;
+    }
+    location /api/ {
+        proxy_pass http://127.0.0.1:${API_PORT}/api/;
+    }
 
-    location /api { proxy_pass http://127.0.0.1:5001; }
-    location /v1 { proxy_pass http://127.0.0.1:5001; }
-    location /files { proxy_pass http://127.0.0.1:5001; }
-    location /console/api { proxy_pass http://127.0.0.1:5001; }
-
-    location /e/ { proxy_pass http://127.0.0.1:5002; }
+    # Plugin daemon (si decides exponer endpoints /e/)
+    location /e/ {
+        proxy_pass http://127.0.0.1:${PLUGIN_PORT}/;
+    }
 }
 NGINX
 
-_asroot "mv '${TMP_CONF}' '${NGINX_CONF}'"
-_asroot "ln -sf '${NGINX_CONF}' '/etc/nginx/sites-enabled/${DOMAIN}.conf'"
-_asroot "nginx -t" || _die "Nginx config inválida"
-_asroot "systemctl reload nginx"
+# Enable y reload
+if [[ ! -f "/etc/nginx/sites-enabled/${DOMAIN}.conf" ]]; then
+  sudo ln -sf "$VHOST" "/etc/nginx/sites-enabled/${DOMAIN}.conf"
+fi
+sudo nginx -t
+sudo systemctl reload nginx
+log "Nginx recargado. (respaldo: $BACKUP)"
 
-# ---------- Levantar servicios ----------
-_green "🐳 Levantando base de datos y redis..."
-$COMPOSE_CMD -f docker-compose.yaml -f docker-compose.override.yaml up -d db redis
+# ---------- Comprobaciones locales ----------
+fail=false
 
-# Esperar a que DB esté healthy
-_green "⏱️ Esperando a que DB esté lista..."
-for i in {1..30}; do
-  state="$($COMPOSE_CMD -f docker-compose.yaml -f docker-compose.override.yaml ps --format json | jq -r '.[] | select(.Service=="db") | .State')"
-  [[ "$state" == "running" || "$state" == "healthy" ]] && break || true
-  sleep 2
-done
+log "Check WEB local http://127.0.0.1:${WEB_PORT}/"
+if ! curl -fsS "http://127.0.0.1:${WEB_PORT}/" >/dev/null; then
+  echo "❌ Web local no responde en :${WEB_PORT}" >&2; fail=true
+else
+  echo "✅ Web local OK"
+fi
 
-# Intento idempotente de crear DB del plugin por si el initdb no corrió (volumen ya existente)
-_green "🗃️ Asegurando DB 'dify_plugin'..."
-$DOCKER exec -i "$(basename "$(pwd)")-db-1" psql -U "${POSTGRES_USER}" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='dify_plugin';" | grep -q 1 || \
-$DOCKER exec -i "$(basename "$(pwd)")-db-1" psql -U "${POSTGRES_USER}" -d postgres -c "CREATE DATABASE dify_plugin OWNER ${POSTGRES_USER};" || true
+log "Check API local http://127.0.0.1:${API_PORT}/ (esperable 404, pero que responda)"
+if curl -fsSI "http://127.0.0.1:${API_PORT}/" >/dev/null; then
+  echo "✅ API local OK (endpoint base responde)"
+else
+  echo "❌ API local no responde en :${API_PORT}" >&2; fail=true
+fi
 
-_green "🚀 Levantando API, Worker, Plugin y Web..."
-$COMPOSE_CMD -f docker-compose.yaml -f docker-compose.override.yaml up -d api worker plugin_daemon web
+# ---------- Comprobaciones vía HTTPS/Nginx ----------
+log "Check HTTPS https://${DOMAIN}/"
+if ! curl -fsSI "https://${DOMAIN}/" >/dev/null; then
+  echo "❌ HTTPS / no responde" >&2; fail=true
+else
+  echo "✅ HTTPS / OK"
+fi
 
-# ---------- Esperas activas (puertos locales) ----------
-_check_http() { curl -fsS "$1" >/dev/null 2>&1; }
+log "Check HTTPS apps https://${DOMAIN}/apps"
+if ! curl -fsSI "https://${DOMAIN}/apps" >/dev/null; then
+  echo "❌ HTTPS /apps no responde" >&2; fail=true
+else
+  echo "✅ HTTPS /apps OK"
+fi
 
-_green "⏱️ Esperando puertos locales..."
-for i in {1..60}; do _check_http "http://127.0.0.1:3000" && break || sleep 2; done
-for i in {1..60}; do (_check_http "http://127.0.0.1:5001" || curl -fsSI "http://127.0.0.1:5001" >/dev/null 2>&1) && break || sleep 2; done
-for i in {1..60}; do (_check_http "http://127.0.0.1:5002" || curl -fsSI "http://127.0.0.1:5002" >/dev/null 2>&1) && break || sleep 2; done
+# Estas rutas pueden devolver 401/404, lo importante es NO 502
+log "Check HTTPS /api (no 502)"
+if curl -sSI "https://${DOMAIN}/api" | grep -q "502 Bad Gateway"; then
+  echo "❌ HTTPS /api devuelve 502" >&2; fail=true
+else
+  echo "✅ HTTPS /api sin 502"
+fi
 
-# ---------- Smoke tests ----------
-_green "🧪 Pruebas locales:"
-if _check_http "http://127.0.0.1:3000"; then _green "  Web OK (127.0.0.1:3000)"; else _yellow "  Web no responde (aún)"; fi
-if curl -fsSI "http://127.0.0.1:5001" >/dev/null; then _green "  API OK (HEAD 5001)"; else _yellow "  API HEAD no concluyente"; fi
-if curl -fsSI "http://127.0.0.1:5002" >/dev/null; then _green "  Plugin OK (HEAD 5002)"; else _yellow "  Plugin HEAD no concluyente"; fi
+log "Check HTTPS /console/api (no 502)"
+if curl -sSI "https://${DOMAIN}/console/api" | grep -q "502 Bad Gateway"; then
+  echo "❌ HTTPS /console/api devuelve 502" >&2; fail=true
+else
+  echo "✅ HTTPS /console/api sin 502"
+fi
 
-_green "🧪 Pruebas HTTPS:"
-if curl -fsSI "https://${DOMAIN}/" >/dev/null; then _green "  https://${DOMAIN}/ OK"; else _yellow "  Raíz no responde (aún)"; fi
-curl -fsSI -H "Origin: https://${DOMAIN}" "https://${DOMAIN}/api" >/dev/null || _yellow "  /api puede retornar 401/404; lo importante es que no sea 502."
+# ---------- Estado final ----------
+log "Estado de contenedores:"
+$DC_ALL ps || true
+
+if [[ "$fail" == "true" ]]; then
+  echo
+  echo "⚠️  Hay checks fallidos. Revisa:"
+  echo " - Logs API:    $DC_ALL logs -n 120 api"
+  echo " - Logs WEB:    $DC_ALL logs -n 120 web"
+  echo " - Logs PLUGIN: $DC_ALL logs -n 120 plugin_daemon"
+  exit 2
+fi
 
 echo
-_green "🎉 Listo. Dify instalado."
-echo "Ruta:        ${INSTALL_DIR}"
-echo "Dominio:     https://${DOMAIN}"
-echo "DB persist:  ${INSTALL_DIR}/data/postgres"
-echo
-echo "Comandos útiles:"
-echo "  cd ${INSTALL_DIR}"
-echo "  $COMPOSE_CMD -f docker-compose.yaml -f docker-compose.override.yaml ps"
-echo "  $COMPOSE_CMD -f docker-compose.yaml -f docker-compose.override.yaml logs -f api"
-echo "  $COMPOSE_CMD -f docker-compose.yaml -f docker-compose.override.yaml up -d"
-echo "  $COMPOSE_CMD -f docker-compose.yaml -f docker-compose.override.yaml down"
+echo "🎉 Listo. Accede a https://${DOMAIN}/apps"
+BASH
+
+chmod +x ~/dify_oneclick.sh
